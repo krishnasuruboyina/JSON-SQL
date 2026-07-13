@@ -64,8 +64,7 @@ alert("JSON uploaded successfully! Schema generated.");
       .map((col) => {
         const columnName = col.column_name?.trim() || "Column";
         const datatype = col.datatype || "VARCHAR(255)";
-        const nullable = col.nullable === "NOT NULL" ? "NOT NULL" : "NULL";
-        return `  "${columnName}" ${datatype} ${nullable}`;
+        return `  "${columnName}" ${datatype} NULL`;
       })
       .join(",\n");
 
@@ -113,6 +112,11 @@ alert("JSON uploaded successfully! Schema generated.");
       return;
     }
 
+    if (!serverName || !databaseName) {
+      alert("Please fill in Host and Database Name in the Database Connection section first");
+      return;
+    }
+
     const formData = new FormData();
     formData.append("file", insertFile);
     formData.append("table_name", insertTableName);
@@ -130,7 +134,11 @@ alert("JSON uploaded successfully! Schema generated.");
 
       const data = await response.json();
       setLoading(false);
-      alert(data.message || data.error || "Data inserted successfully");
+      let msg = data.message || data.error || "Data inserted successfully";
+      if (data.errors && data.errors.length > 0) {
+        msg += "\n\nDetails:\n" + data.errors.join("\n");
+      }
+      alert(msg);
     } catch (error) {
       setLoading(false);
       alert("Error inserting data");
