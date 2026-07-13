@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import json
+import re
 import psycopg2
 from dotenv import load_dotenv
 import os
@@ -9,6 +10,10 @@ load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
+
+# Render's managed Postgres URL (set this in Render's Environment tab)
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 @app.route("/")
 def home():
     return "JSONSQL Backend is Running!"
@@ -23,15 +28,26 @@ def is_nested_json(data):
     return False
 
 
-def get_connection(host, database_name, username, password, port=5432):
+VALID_IDENTIFIER = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+def is_safe_identifier(name):
+    """Only allow table/column names that look like plain SQL identifiers."""
+    return bool(name) and bool(VALID_IDENTIFIER.match(name)) and len(name) <= 63
+
+
+def get_connection(host=None, database_name=None, username=None, password=None, port=5432):
     try:
-        conn = psycopg2.connect(
-            host=host,
-            database=database_name,
-            user=username,
-            password=password,
-            port=port
-        )
+        # Prefer Render's DATABASE_URL if no explicit credentials were passed in
+        if DATABASE_URL and not host:
+            conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+        else:
+            conn = psycopg2.connect(
+                host=host,
+                database=database_name,
+                user=username,
+                password=password,
+                port=port
+            )
         return conn
     except Exception as e:
         raise Exception(f"Database connection failed: {str(e)}")
@@ -67,16 +83,19 @@ def upload_json():
 
             if any(x in column_lower for x in ["guid", "rowident"]):
               datatype = "UUID"
-            elif any(x in column_lower for x in ["id"]):
+            elif column_lower == "id" or column_lower.endswith("_id"):
               datatype = "INTEGER"
             elif any(x in column_lower for x in ["phone", "mobile", "contact", "aadhaar", "pan", "pincode"]):
                 max_length = max((len(str(v)
                                       ) for v in values), default=255)
                 if max_length == 0: max_length = 255
                 datatype = f"VARCHAR({max_length})"
+            elif not values:
+                # No non-null values to infer from — keep the VARCHAR(255) default
+                pass
             elif all(isinstance(v, bool) for v in values):
                 datatype = "BOOLEAN"
-            elif any(isinstance(v, float) for v in values):
+            elif all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values) and any(isinstance(v, float) for v in values):
                 datatype = "NUMERIC(18,6)"
             elif all(isinstance(v, int) and not isinstance(v, bool) for v in values):
                 max_num = max(values) if values else 0
@@ -117,7 +136,10 @@ def create_table():
         username = data.get("username")
         password = data.get("password")
 
-        conn = get_connection(server_name, database_name, username, password)
+        if server_name:
+            conn = get_connection(server_name, database_name, username, password)
+        else:
+            conn = get_connection()  # uses DATABASE_URL
         cursor = conn.cursor()
         cursor.execute(ddl_query)
         conn.commit()
@@ -143,6 +165,8 @@ def insert_data():
         table_name = request.form.get("table_name")
         if not table_name:
             return jsonify({"error": "Enter table name"}), 400
+        if not is_safe_identifier(table_name):
+            return jsonify({"error": "Invalid table name. Use only letters, numbers, and underscores, and don't start with a number."}), 400
 
         json_data = json.load(file)
         if not isinstance(json_data, list):
@@ -166,25 +190,37 @@ def insert_data():
         username = request.form.get("username")
         password = request.form.get("password")
 
-        conn = get_connection(server_name, database_name, username, password)
+        if server_name:
+            conn = get_connection(server_name, database_name, username, password)
+        else:
+            conn = get_connection()  # uses DATABASE_URL
         cursor = conn.cursor()
 
         inserted_count = 0
         skipped_count = 0
+        errors = []
 
         for row in unique_rows:
+            bad_columns = [col for col in row.keys() if not is_safe_identifier(col)]
+            if bad_columns:
+                skipped_count += 1
+                errors.append(f"Skipped row: invalid column name(s) {bad_columns}")
+                continue
+
             columns = ", ".join([f'"{col}"' for col in row.keys()])
             placeholders = ", ".join(["%s"] * len(row))
             values = list(row.values())
 
-            insert_query = f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders})"
+            insert_query = f'INSERT INTO "{table_name}" ({columns}) VALUES ({placeholders})'
 
             try:
                 cursor.execute(insert_query, values)
                 inserted_count += 1
             except Exception as e:
+                conn.rollback()
                 print("insert Error: ", e)
                 skipped_count += 1
+                errors.append(str(e))
 
         conn.commit()
         cursor.close()
@@ -194,7 +230,11 @@ def insert_data():
         if skipped_count > 0:
             message += f", {skipped_count} skipped"
 
-        return jsonify({"message": message})
+        response = {"message": message}
+        if errors:
+            response["errors"] = errors[:10]  # cap so the response doesn't explode on bad files
+
+        return jsonify(response)
 
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -202,5 +242,6 @@ def insert_data():
 
 if __name__ == "__main__":
     port = int(os.getenv('PORT', 5000))
+    debug_mode = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
     print(f"🚀 JSONSQL Backend running on http://localhost:{port}")
-    app.run(debug=True, port=port)
+    app.run(debug=debug_mode, port=port)
