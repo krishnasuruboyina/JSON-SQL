@@ -1,0 +1,199 @@
+/* ===========================
+   JSON to SQL Generator UI
+=========================== */
+
+*{
+    margin:0;
+    padding:0;
+    box-sizing:border-box;
+}
+
+body{
+    font-family:'Segoe UI',sans-serif;
+    background:linear-gradient(135deg,#eef4ff,#d9e7ff);
+    padding:30px;
+    color:#333;
+}
+
+.container{
+    max-width:1250px;
+    margin:auto;
+    background:#fff;
+    padding:35px;
+    border-radius:18px;
+    box-shadow:0 15px 35px rgba(0,0,0,.12);
+}
+
+h1{
+    text-align:center;
+    color:#0d47a1;
+    margin-bottom:35px;
+    font-size:40px;
+    font-weight:bold;
+}
+
+h2{
+    color:#1565c0;
+    margin-bottom:18px;
+    padding-bottom:8px;
+    border-bottom:3px solid #1565c0;
+}
+
+.section{
+    background:#fafcff;
+    border-radius:15px;
+    padding:25px;
+    margin-bottom:35px;
+    box-shadow:0 6px 18px rgba(0,0,0,.08);
+}
+
+input,
+select,
+textarea{
+    width:100%;
+    max-width:420px;
+    padding:12px 15px;
+    border:1px solid #cfd8dc;
+    border-radius:10px;
+    font-size:15px;
+    margin:8px 0;
+    outline:none;
+    transition:.3s;
+}
+
+input:focus,
+select:focus,
+textarea:focus{
+    border-color:#1976d2;
+    box-shadow:0 0 8px rgba(25,118,210,.3);
+}
+
+textarea{
+    max-width:100%;
+    min-height:220px;
+    resize:vertical;
+}
+
+button{
+    background:linear-gradient(135deg,#1976d2,#0d47a1);
+    color:white;
+    border:none;
+    border-radius:10px;
+    padding:12px 22px;
+    font-size:15px;
+    cursor:pointer;
+    margin-top:10px;
+    transition:.3s;
+    font-weight:600;
+}
+
+button:hover{
+    transform:translateY(-2px);
+    box-shadow:0 10px 18px rgba(13,71,161,.35);
+}
+
+button:active{
+    transform:scale(.97);
+}
+
+table{
+    width:100%;
+    border-collapse:collapse;
+    margin-top:20px;
+    overflow:hidden;
+    border-radius:12px;
+}
+
+table th{
+    background:#1565c0;
+    color:white;
+    padding:14px;
+    font-size:15px;
+}
+
+table td{
+    border:1px solid #e5e5e5;
+    padding:12px;
+    text-align:center;
+}
+
+table tr:nth-child(even){
+    background:#f8fbff;
+}
+
+table tr:hover{
+    background:#e3f2fd;
+}
+
+pre{
+    background:#1e293b;
+    color:#22c55e;
+    padding:20px;
+    border-radius:12px;
+    overflow-x:auto;
+    font-size:14px;
+    line-height:1.6;
+    margin-top:15px;
+}
+
+.copy-btn{
+    margin-top:15px;
+}
+
+.loading{
+    color:#1976d2;
+    font-size:18px;
+    font-weight:bold;
+}
+
+label{
+    display:block;
+    margin-top:12px;
+    margin-bottom:5px;
+    font-weight:600;
+}
+
+::-webkit-scrollbar{
+    width:8px;
+    height:8px;
+}
+
+::-webkit-scrollbar-thumb{
+    background:#1976d2;
+    border-radius:20px;
+}
+
+::-webkit-scrollbar-track{
+    background:#eeeeee;
+}
+
+@media(max-width:768px){
+
+body{
+    padding:15px;
+}
+
+.container{
+    padding:20px;
+}
+
+h1{
+    font-size:30px;
+}
+
+input,
+select,
+textarea{
+    max-width:100%;
+}
+
+button{
+    width:100%;
+}
+
+table{
+    display:block;
+    overflow-x:auto;
+}
+
+}
