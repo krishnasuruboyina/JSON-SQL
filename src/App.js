@@ -61,7 +61,7 @@ function App() {
 
     try {
       setLoading(true);
-      const response = await fetch("https://jsonsql-backend.onrender.com/upload", {
+      const response = await fetch("https://json-sql-bghs.onrender.com/upload", {
         method: "POST",
         body: formData,
       });
@@ -117,7 +117,7 @@ function App() {
 
     try {
       setLoading(true);
-      const response = await fetch("https://jsonsql-backend.onrender.com/create-table", {
+      const response = await fetch("https://json-sql-bghs.onrender.com/create-table", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -160,7 +160,7 @@ function App() {
 
     try {
       setLoading(true);
-      const response = await fetch("https://jsonsql-backend.onrender.com/insert-data", {
+      const response = await fetch("https://json-sql-bghs.onrender.com/insert-data", {
         method: "POST",
         body: formData,
       });
