@@ -68,7 +68,7 @@ def get_connection(db_type, host, database_name, username, password, port=None):
             import psycopg2
             return psycopg2.connect(
                 host=host, database=database_name,
-                user=username, password=password, port=port
+                user=username, password=password, port=port,sslmode="require"
             )
 
         elif db_type == "mysql":
