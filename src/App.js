@@ -29,7 +29,7 @@ function App() {
 
     try {
       setLoading(true);
-      const response = await fetch("https://jsonsql-backend.onrender.com/upload", {
+      const response = await fetch("https://json-sql-bghs.onrender.com/upload", {
   method: "POST",
   body: formData,
 });
