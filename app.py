@@ -185,6 +185,87 @@ def map_datatype(db_type, category, length=255, max_num=0):
 
 
 # -----------------------------------
+# DYNAMIC COLUMN WIDENING (per engine)
+# -----------------------------------
+VARIABLE_CHAR_TYPES = {"character varying", "varchar", "nvarchar", "varchar2"}
+
+
+def get_string_column_info(cursor, db_type, table_name):
+    """Return {column_name: (data_type, char_length)} for the table's columns.
+    char_length is None/-1 when the column has no fixed limit (e.g. TEXT/CLOB/MAX)."""
+    info = {}
+    try:
+        if db_type == "postgresql":
+            cursor.execute(
+                "SELECT column_name, data_type, character_maximum_length "
+                "FROM information_schema.columns WHERE table_name = %s",
+                (table_name,)
+            )
+        elif db_type == "mysql":
+            cursor.execute(
+                "SELECT column_name, data_type, character_maximum_length "
+                "FROM information_schema.columns WHERE table_name = %s AND table_schema = DATABASE()",
+                (table_name,)
+            )
+        elif db_type == "mssql":
+            cursor.execute(
+                "SELECT column_name, data_type, character_maximum_length "
+                "FROM information_schema.columns WHERE table_name = %s",
+                (table_name,)
+            )
+        elif db_type == "oracle":
+            cursor.execute(
+                "SELECT column_name, data_type, char_length FROM user_tab_columns WHERE table_name = :1",
+                (table_name,)
+            )
+        for row in cursor.fetchall():
+            col_name, data_type, char_len = row[0], row[1], row[2]
+            info[col_name] = (data_type, char_len)
+    except Exception:
+        # If introspection isn't possible (permissions, unsupported catalog, etc.),
+        # widening is skipped for this run and normal insert/skip behavior applies.
+        pass
+    return info
+
+
+def widen_column(cursor, db_type, table_name, column_name, new_length):
+    quoted_table = quote_identifier(db_type, table_name)
+    quoted_col = quote_identifier(db_type, column_name)
+    if db_type == "postgresql":
+        cursor.execute(f'ALTER TABLE {quoted_table} ALTER COLUMN {quoted_col} TYPE VARCHAR({new_length})')
+    elif db_type == "mysql":
+        cursor.execute(f'ALTER TABLE {quoted_table} MODIFY COLUMN {quoted_col} VARCHAR({new_length})')
+    elif db_type == "mssql":
+        cursor.execute(f'ALTER TABLE {quoted_table} ALTER COLUMN {quoted_col} NVARCHAR({new_length}) NULL')
+    elif db_type == "oracle":
+        cursor.execute(f'ALTER TABLE {quoted_table} MODIFY {quoted_col} VARCHAR2({new_length})')
+
+
+def auto_widen_columns(cursor, db_type, table_name, rows):
+    """Compare the longest string value per column against the table's current column
+    size, and widen any variable-length character column that's too small."""
+    column_info = get_string_column_info(cursor, db_type, table_name)
+    if not column_info:
+        return
+
+    needed_lengths = {}
+    for row in rows:
+        for col, val in row.items():
+            if isinstance(val, str):
+                needed_lengths[col] = max(needed_lengths.get(col, 0), len(val))
+
+    for col, needed in needed_lengths.items():
+        data_type, current_len = column_info.get(col, (None, None))
+        if data_type is None or data_type.lower() not in VARIABLE_CHAR_TYPES:
+            continue  # not a resizable variable-length text column (e.g. UUID, INTEGER, TEXT/CLOB)
+        if current_len is None or current_len == -1:
+            continue  # already unlimited (e.g. NVARCHAR(MAX))
+        if needed > current_len:
+            new_length = needed + 50  # small buffer to reduce repeated ALTERs on future inserts
+            widen_column(cursor, db_type, table_name, col, new_length)
+
+
+# -----------------------------------
 # UPLOAD JSON & RETURN SCHEMA
 # -----------------------------------
 @app.route('/upload', methods=['POST'])
@@ -338,6 +419,15 @@ def insert_data():
         cursor = conn.cursor()
 
         quoted_table = quote_identifier(db_type, table_name)
+
+        # Widen any text columns that are too small for the incoming data,
+        # instead of silently skipping rows that don't fit.
+        try:
+            auto_widen_columns(cursor, db_type, table_name, unique_rows)
+            conn.commit()
+        except Exception as widen_error:
+            print("Column widen skipped:", widen_error)
+            conn.rollback()
 
         inserted_count = 0
         skipped_count = 0
