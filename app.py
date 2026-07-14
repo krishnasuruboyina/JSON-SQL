@@ -265,6 +265,108 @@ def auto_widen_columns(cursor, db_type, table_name, rows):
             widen_column(cursor, db_type, table_name, col, new_length)
 
 
+def get_existing_columns(cursor, db_type, table_name):
+    """Return the set of column names that currently exist on the table."""
+    existing = set()
+    try:
+        if db_type == "postgresql":
+            cursor.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+                (table_name,)
+            )
+        elif db_type == "mysql":
+            cursor.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = %s AND table_schema = DATABASE()",
+                (table_name,)
+            )
+        elif db_type == "mssql":
+            cursor.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+                (table_name,)
+            )
+        elif db_type == "oracle":
+            cursor.execute(
+                "SELECT column_name FROM user_tab_columns WHERE table_name = :1",
+                (table_name,)
+            )
+        for row in cursor.fetchall():
+            existing.add(row[0])
+    except Exception:
+        pass
+    return existing
+
+
+def add_column(cursor, db_type, table_name, column_name, datatype):
+    quoted_table = quote_identifier(db_type, table_name)
+    quoted_col = quote_identifier(db_type, column_name)
+    if db_type == "postgresql":
+        cursor.execute(f'ALTER TABLE {quoted_table} ADD COLUMN {quoted_col} {datatype}')
+    elif db_type == "mysql":
+        cursor.execute(f'ALTER TABLE {quoted_table} ADD COLUMN {quoted_col} {datatype}')
+    elif db_type == "mssql":
+        cursor.execute(f'ALTER TABLE {quoted_table} ADD {quoted_col} {datatype}')
+    elif db_type == "oracle":
+        cursor.execute(f'ALTER TABLE {quoted_table} ADD ({quoted_col} {datatype})')
+
+
+def auto_add_missing_columns(cursor, db_type, table_name, rows):
+    """Detect JSON keys that don't exist as columns on the table yet, infer a
+    datatype for each from the incoming data, and add them via ALTER TABLE."""
+    existing_columns = get_existing_columns(cursor, db_type, table_name)
+    if not existing_columns:
+        return  # table introspection failed or table has no columns; skip safely
+
+    all_keys = set()
+    for row in rows:
+        all_keys.update(row.keys())
+
+    # Case-insensitive comparison guards against engines that fold identifier case
+    existing_lower = {c.lower() for c in existing_columns}
+    missing_keys = [k for k in all_keys if k.lower() not in existing_lower]
+
+    for key in missing_keys:
+        values = [row.get(key) for row in rows if row.get(key) is not None]
+        category, max_length, max_num = infer_column_category(key, values)
+        datatype = map_datatype(db_type, category, length=max_length, max_num=max_num)
+        add_column(cursor, db_type, table_name, key, datatype)
+
+
+# -----------------------------------
+# COLUMN CATEGORY INFERENCE (shared by /upload and auto-add-columns)
+# -----------------------------------
+def infer_column_category(key, values):
+    """Given a column name and its non-null values, return (category, max_length, max_num)."""
+    column_lower = key.lower()
+    category = "varchar"
+    max_length = 255
+    max_num = 0
+
+    if any(x in column_lower for x in ["guid", "rowident"]):
+        category = "uuid"
+    elif any(x in column_lower for x in ["id"]):
+        category = "integer"
+        max_num = max([v for v in values if isinstance(v, int)], default=0)
+    elif any(x in column_lower for x in ["phone", "mobile", "contact", "aadhaar", "pan", "pincode"]):
+        max_length = max((len(str(v)) for v in values), default=255)
+        if max_length == 0:
+            max_length = 255
+        category = "varchar"
+    elif all(isinstance(v, bool) for v in values):
+        category = "boolean"
+    elif any(isinstance(v, float) for v in values):
+        category = "numeric"
+    elif all(isinstance(v, int) and not isinstance(v, bool) for v in values):
+        category = "integer"
+        max_num = max(values) if values else 0
+    elif all(isinstance(v, str) for v in values):
+        max_length = max((len(str(v)) for v in values), default=255)
+        if max_length == 0:
+            max_length = 255
+        category = "text" if max_length > 255 else "varchar"
+
+    return category, max_length, max_num
+
+
 # -----------------------------------
 # UPLOAD JSON & RETURN SCHEMA
 # -----------------------------------
@@ -291,35 +393,8 @@ def upload_json():
         for key in all_keys:
             values = [row.get(key) for row in data if row.get(key) is not None]
 
-            column_lower = key.lower()
-            category = "varchar"
+            category, max_length, max_num = infer_column_category(key, values)
             nullable = "NULL"
-            max_length = 255
-            max_num = 0
-
-            if any(x in column_lower for x in ["guid", "rowident"]):
-                category = "uuid"
-            elif any(x in column_lower for x in ["id"]):
-                category = "integer"
-                max_num = max([v for v in values if isinstance(v, int)], default=0)
-            elif any(x in column_lower for x in ["phone", "mobile", "contact", "aadhaar", "pan", "pincode"]):
-                max_length = max((len(str(v)) for v in values), default=255)
-                if max_length == 0:
-                    max_length = 255
-                category = "varchar"
-            elif all(isinstance(v, bool) for v in values):
-                category = "boolean"
-            elif any(isinstance(v, float) for v in values):
-                category = "numeric"
-            elif all(isinstance(v, int) and not isinstance(v, bool) for v in values):
-                category = "integer"
-                max_num = max(values) if values else 0
-            elif all(isinstance(v, str) for v in values):
-                max_length = max((len(str(v)) for v in values), default=255)
-                if max_length == 0:
-                    max_length = 255
-                category = "text" if max_length > 255 else "varchar"
-
             datatype = map_datatype(db_type, category, length=max_length, max_num=max_num)
 
             table_structure.append({
@@ -419,6 +494,15 @@ def insert_data():
         cursor = conn.cursor()
 
         quoted_table = quote_identifier(db_type, table_name)
+
+        # Add any columns present in the JSON but missing from the table,
+        # instead of failing/skipping rows that have new keys.
+        try:
+            auto_add_missing_columns(cursor, db_type, table_name, unique_rows)
+            conn.commit()
+        except Exception as add_col_error:
+            print("Add column skipped:", add_col_error)
+            conn.rollback()
 
         # Widen any text columns that are too small for the incoming data,
         # instead of silently skipping rows that don't fit.
