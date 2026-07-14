@@ -1,5 +1,16 @@
 flask
 flask-cors
-psycopg2-binary
 python-dotenv
 gunicorn
+
+# PostgreSQL
+psycopg2-binary
+
+# MySQL
+pymysql
+
+# SQL Server (pure-python TDS driver, no ODBC driver install needed)
+python-tds
+
+# Oracle (thin mode, no Oracle Instant Client needed)
+oracledb
