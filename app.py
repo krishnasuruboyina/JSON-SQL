@@ -79,10 +79,25 @@ def get_connection(db_type, host, database_name, username, password, port=None):
             )
 
         elif db_type == "mssql":
-            import pytds
-            return pytds.connect(
-                dsn=host, database=database_name,
-                user=username, password=password, port=port
+    import pytds
+
+    if host and "\\" in host:
+        # Named instance (e.g. .\SQLEXPRESS)
+        return pytds.connect(
+            dsn=host,
+            database=database_name,
+            user=username,
+            password=password
+        )
+    else:
+        # Server + Port (e.g. localhost:1433)
+        return pytds.connect(
+            server=host,
+            port=int(port) if port else 1433,
+            database=database_name,
+            user=username,
+            password=password
+        )
             )
 
         elif db_type == "oracle":
