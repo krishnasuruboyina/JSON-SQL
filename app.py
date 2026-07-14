@@ -98,7 +98,7 @@ def get_connection(db_type, host, database_name, username, password, port=None):
             user=username,
             password=password
         )
-            )
+            
 
         elif db_type == "oracle":
             import oracledb
