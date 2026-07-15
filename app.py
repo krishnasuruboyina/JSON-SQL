@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import json
+import re
 from dotenv import load_dotenv
 import os
 
@@ -345,6 +346,47 @@ def add_column(cursor, db_type, table_name, column_name, datatype):
         cursor.execute(f'ALTER TABLE {quoted_table} ADD ({quoted_col} {datatype})')
 
 
+# -----------------------------------
+# COLUMN NAME NORMALIZATION (matches emp_name / empName / Emp Name as the same column)
+# -----------------------------------
+def normalize_key(name):
+    """Strip case, underscores, spaces, and hyphens so columns referring to the
+    same field under different naming conventions compare equal
+    (e.g. 'emp_name', 'empName', 'Emp Name' all normalize to 'empname')."""
+    return re.sub(r'[^a-z0-9]', '', str(name).lower())
+
+
+def build_normalized_column_map(existing_columns):
+    """Map normalized_name -> actual existing column name (first match wins)."""
+    norm_map = {}
+    for col in existing_columns:
+        norm = normalize_key(col)
+        if norm not in norm_map:
+            norm_map[norm] = col
+    return norm_map
+
+
+def remap_rows_to_existing_columns(rows, existing_columns):
+    """Rename incoming JSON keys to match an existing DB column when they refer
+    to the same logical field under a different naming convention
+    (e.g. incoming 'empName' gets renamed to match existing column 'emp_name').
+    Keys with no normalized match are left as-is -- those are genuinely new fields."""
+    norm_map = build_normalized_column_map(existing_columns)
+    remapped_rows = []
+    for row in rows:
+        new_row = {}
+        for key, val in row.items():
+            target_key = norm_map.get(normalize_key(key), key)
+            # If two differently-named incoming keys map to the same existing
+            # column, keep whichever value is non-null.
+            if target_key in new_row and new_row[target_key] is not None:
+                continue
+            new_row[target_key] = val
+        remapped_rows.append(new_row)
+    return remapped_rows
+
+
+
 def auto_add_missing_columns(cursor, conn, db_type, table_name, rows):
     """Detect JSON keys that don't exist as columns on the table yet, infer a
     datatype for each from the incoming data, and add them via ALTER TABLE.
@@ -358,9 +400,16 @@ def auto_add_missing_columns(cursor, conn, db_type, table_name, rows):
     for row in rows:
         all_keys.update(row.keys())
 
-    # Case-insensitive comparison guards against engines that fold identifier case
-    existing_lower = {c.lower() for c in existing_columns}
-    missing_keys = [k for k in all_keys if k.lower() not in existing_lower]
+    # Normalized comparison guards against both case differences AND naming
+    # convention differences (emp_name vs empName vs Emp Name all match).
+    existing_norms = {normalize_key(c) for c in existing_columns}
+    missing_keys = []
+    seen_norms = set()
+    for k in all_keys:
+        norm = normalize_key(k)
+        if norm not in existing_norms and norm not in seen_norms:
+            missing_keys.append(k)
+            seen_norms.add(norm)
 
     added = []
     failed = []
@@ -525,15 +574,6 @@ def insert_data():
             if is_nested_json(row):
                 return jsonify({"error": "Nested JSON files are not allowed"}), 400
 
-        # Remove duplicates
-        unique_rows = []
-        seen = set()
-        for row in json_data:
-            row_tuple = tuple(sorted(row.items()))
-            if row_tuple not in seen:
-                seen.add(row_tuple)
-                unique_rows.append(row)
-
         server_name = request.form.get("server_name")
         database_name = request.form.get("database_name")
         username = request.form.get("username")
@@ -544,6 +584,22 @@ def insert_data():
         cursor = conn.cursor()
 
         quoted_table = quote_identifier(db_type, table_name)
+
+        # Rename incoming keys to match existing columns under a different naming
+        # convention (e.g. 'empName' -> 'emp_name') BEFORE dedup/insert, so data
+        # lands in the existing column instead of spawning a near-duplicate one.
+        existing_columns_before = get_existing_columns(cursor, db_type, table_name)
+        if existing_columns_before:
+            json_data = remap_rows_to_existing_columns(json_data, existing_columns_before)
+
+        # Remove duplicates
+        unique_rows = []
+        seen = set()
+        for row in json_data:
+            row_tuple = tuple(sorted(row.items()))
+            if row_tuple not in seen:
+                seen.add(row_tuple)
+                unique_rows.append(row)
 
         # Add any columns present in the JSON but missing from the table,
         # instead of failing/skipping rows that have new keys.
