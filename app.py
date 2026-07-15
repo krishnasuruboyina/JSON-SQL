@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import json
 from dotenv import load_dotenv
@@ -8,6 +8,11 @@ load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
+
+# When running as a desktop app, desktop.py sets this env var before importing
+# this module so Flask can also serve the bundled React build. On Render (or
+# any normal web deployment) this stays unset, so behavior is unchanged.
+FRONTEND_BUILD_DIR = os.environ.get("FRONTEND_BUILD_DIR")
 
 # -----------------------------------
 # SUPPORTED DATABASES
@@ -24,7 +29,24 @@ DEFAULT_PORTS = {
 
 @app.route("/")
 def home():
+    if FRONTEND_BUILD_DIR and os.path.exists(os.path.join(FRONTEND_BUILD_DIR, "index.html")):
+        return send_from_directory(FRONTEND_BUILD_DIR, "index.html")
     return "JSONSQL Backend is Running!"
+
+
+@app.route("/<path:path>")
+def serve_frontend_asset(path):
+    # Only active in desktop mode (FRONTEND_BUILD_DIR set). On Render this
+    # falls through to Flask's normal 404 handling for unmatched routes,
+    # same as before.
+    if FRONTEND_BUILD_DIR:
+        full_path = os.path.join(FRONTEND_BUILD_DIR, path)
+        if os.path.isfile(full_path):
+            return send_from_directory(FRONTEND_BUILD_DIR, path)
+        index_path = os.path.join(FRONTEND_BUILD_DIR, "index.html")
+        if os.path.exists(index_path):
+            return send_from_directory(FRONTEND_BUILD_DIR, "index.html")
+    return jsonify({"error": "Not found"}), 404
 
 
 # -----------------------------------
@@ -241,18 +263,23 @@ def widen_column(cursor, db_type, table_name, column_name, new_length):
         cursor.execute(f'ALTER TABLE {quoted_table} MODIFY {quoted_col} VARCHAR2({new_length})')
 
 
-def auto_widen_columns(cursor, db_type, table_name, rows):
+def auto_widen_columns(cursor, conn, db_type, table_name, rows):
     """Compare the longest string value per column against the table's current column
-    size, and widen any variable-length character column that's too small."""
+    size, and widen any variable-length character column that's too small.
+    Commits after each successful ALTER so one column's failure can't roll back
+    another column that was already widened in the same batch."""
     column_info = get_string_column_info(cursor, db_type, table_name)
     if not column_info:
-        return
+        return {"widened": [], "failed": []}
 
     needed_lengths = {}
     for row in rows:
         for col, val in row.items():
             if isinstance(val, str):
                 needed_lengths[col] = max(needed_lengths.get(col, 0), len(val))
+
+    widened = []
+    failed = []
 
     for col, needed in needed_lengths.items():
         data_type, current_len = column_info.get(col, (None, None))
@@ -262,7 +289,16 @@ def auto_widen_columns(cursor, db_type, table_name, rows):
             continue  # already unlimited (e.g. NVARCHAR(MAX))
         if needed > current_len:
             new_length = needed + 50  # small buffer to reduce repeated ALTERs on future inserts
-            widen_column(cursor, db_type, table_name, col, new_length)
+            try:
+                widen_column(cursor, db_type, table_name, col, new_length)
+                conn.commit()
+                widened.append(col)
+            except Exception as e:
+                print(f"Could not widen column '{col}': {e}")
+                conn.rollback()
+                failed.append(col)
+
+    return {"widened": widened, "failed": failed}
 
 
 def get_existing_columns(cursor, db_type, table_name):
@@ -309,12 +345,14 @@ def add_column(cursor, db_type, table_name, column_name, datatype):
         cursor.execute(f'ALTER TABLE {quoted_table} ADD ({quoted_col} {datatype})')
 
 
-def auto_add_missing_columns(cursor, db_type, table_name, rows):
+def auto_add_missing_columns(cursor, conn, db_type, table_name, rows):
     """Detect JSON keys that don't exist as columns on the table yet, infer a
-    datatype for each from the incoming data, and add them via ALTER TABLE."""
+    datatype for each from the incoming data, and add them via ALTER TABLE.
+    Commits after each successful ADD COLUMN so one column's failure can't
+    roll back another column that was already added in the same batch."""
     existing_columns = get_existing_columns(cursor, db_type, table_name)
     if not existing_columns:
-        return  # table introspection failed or table has no columns; skip safely
+        return {"added": [], "failed": []}  # table introspection failed or table has no columns; skip safely
 
     all_keys = set()
     for row in rows:
@@ -324,11 +362,23 @@ def auto_add_missing_columns(cursor, db_type, table_name, rows):
     existing_lower = {c.lower() for c in existing_columns}
     missing_keys = [k for k in all_keys if k.lower() not in existing_lower]
 
+    added = []
+    failed = []
+
     for key in missing_keys:
         values = [row.get(key) for row in rows if row.get(key) is not None]
         category, max_length, max_num = infer_column_category(key, values)
         datatype = map_datatype(db_type, category, length=max_length, max_num=max_num)
-        add_column(cursor, db_type, table_name, key, datatype)
+        try:
+            add_column(cursor, db_type, table_name, key, datatype)
+            conn.commit()
+            added.append(key)
+        except Exception as e:
+            print(f"Could not add column '{key}': {e}")
+            conn.rollback()
+            failed.append(key)
+
+    return {"added": added, "failed": failed}
 
 
 # -----------------------------------
@@ -497,24 +547,25 @@ def insert_data():
 
         # Add any columns present in the JSON but missing from the table,
         # instead of failing/skipping rows that have new keys.
+        add_result = {"added": [], "failed": []}
         try:
-            auto_add_missing_columns(cursor, db_type, table_name, unique_rows)
-            conn.commit()
+            add_result = auto_add_missing_columns(cursor, conn, db_type, table_name, unique_rows)
         except Exception as add_col_error:
-            print("Add column skipped:", add_col_error)
+            print("Add column step failed:", add_col_error)
             conn.rollback()
 
         # Widen any text columns that are too small for the incoming data,
         # instead of silently skipping rows that don't fit.
+        widen_result = {"widened": [], "failed": []}
         try:
-            auto_widen_columns(cursor, db_type, table_name, unique_rows)
-            conn.commit()
+            widen_result = auto_widen_columns(cursor, conn, db_type, table_name, unique_rows)
         except Exception as widen_error:
-            print("Column widen skipped:", widen_error)
+            print("Column widen step failed:", widen_error)
             conn.rollback()
 
         inserted_count = 0
         skipped_count = 0
+        first_skip_reason = None
 
         for row in unique_rows:
             columns = ", ".join([quote_identifier(db_type, col) for col in row.keys()])
@@ -525,16 +576,27 @@ def insert_data():
 
             try:
                 cursor.execute(insert_query, values)
+                conn.commit()
                 inserted_count += 1
             except Exception as e:
                 print("insert Error: ", e)
+                conn.rollback()
+                if first_skip_reason is None:
+                    first_skip_reason = str(e)
                 skipped_count += 1
-
-        conn.commit()
 
         message = f"{inserted_count} rows inserted"
         if skipped_count > 0:
             message += f", {skipped_count} skipped"
+            if first_skip_reason:
+                message += f" (e.g. {first_skip_reason})"
+
+        if add_result["added"]:
+            message += f". Added columns: {', '.join(add_result['added'])}"
+        if add_result["failed"]:
+            message += f". Could not add columns: {', '.join(add_result['failed'])}"
+        if widen_result["widened"]:
+            message += f". Widened columns: {', '.join(widen_result['widened'])}"
 
         return jsonify({"message": message})
 
