@@ -356,6 +356,21 @@ def normalize_key(name):
     return re.sub(r'[^a-z0-9]', '', str(name).lower())
 
 
+def derive_table_prefixes(table_name):
+    """Normalized singular/plural guesses for the table name, used to strip a
+    table-name prefix off columns like 'studentId' so it can match an existing
+    generic column like 'id' on the 'students' table."""
+    if not table_name:
+        return set()
+    base = normalize_key(table_name)
+    prefixes = {base}
+    if base.endswith('s') and len(base) > 1:
+        prefixes.add(base[:-1])   # students -> student
+    else:
+        prefixes.add(base + 's')  # student -> students
+    return {p for p in prefixes if p}
+
+
 def build_normalized_column_map(existing_columns):
     """Map normalized_name -> actual existing column name (first match wins)."""
     norm_map = {}
@@ -366,17 +381,44 @@ def build_normalized_column_map(existing_columns):
     return norm_map
 
 
-def remap_rows_to_existing_columns(rows, existing_columns):
+def resolve_existing_column(key, norm_map, table_prefixes):
+    """Find the existing column a given incoming key refers to, trying:
+    1. A direct normalized match (emp_name == empName)
+    2. Stripping a table-name prefix from the key (studentId -> id)
+    3. Adding a table-name prefix to the key (id -> studentId, if that's what exists)
+    Returns the existing column name, or the original key if nothing matches."""
+    norm_key = normalize_key(key)
+
+    if norm_key in norm_map:
+        return norm_map[norm_key]
+
+    for prefix in table_prefixes:
+        if norm_key.startswith(prefix) and len(norm_key) > len(prefix):
+            stripped = norm_key[len(prefix):]
+            if stripped in norm_map:
+                return norm_map[stripped]
+
+    for prefix in table_prefixes:
+        prefixed = prefix + norm_key
+        if prefixed in norm_map:
+            return norm_map[prefixed]
+
+    return key  # no match found -- this is a genuinely new column
+
+
+def remap_rows_to_existing_columns(rows, existing_columns, table_name=None):
     """Rename incoming JSON keys to match an existing DB column when they refer
-    to the same logical field under a different naming convention
-    (e.g. incoming 'empName' gets renamed to match existing column 'emp_name').
-    Keys with no normalized match are left as-is -- those are genuinely new fields."""
+    to the same logical field under a different naming convention or a
+    table-prefixed id pattern (e.g. 'empName' -> 'emp_name', 'studentId' -> 'id'
+    on the 'students' table). Keys with no match are left as-is -- genuinely new fields."""
     norm_map = build_normalized_column_map(existing_columns)
+    table_prefixes = derive_table_prefixes(table_name)
+
     remapped_rows = []
     for row in rows:
         new_row = {}
         for key, val in row.items():
-            target_key = norm_map.get(normalize_key(key), key)
+            target_key = resolve_existing_column(key, norm_map, table_prefixes)
             # If two differently-named incoming keys map to the same existing
             # column, keep whichever value is non-null.
             if target_key in new_row and new_row[target_key] is not None:
@@ -384,7 +426,6 @@ def remap_rows_to_existing_columns(rows, existing_columns):
             new_row[target_key] = val
         remapped_rows.append(new_row)
     return remapped_rows
-
 
 
 def auto_add_missing_columns(cursor, conn, db_type, table_name, rows):
@@ -400,14 +441,17 @@ def auto_add_missing_columns(cursor, conn, db_type, table_name, rows):
     for row in rows:
         all_keys.update(row.keys())
 
-    # Normalized comparison guards against both case differences AND naming
-    # convention differences (emp_name vs empName vs Emp Name all match).
-    existing_norms = {normalize_key(c) for c in existing_columns}
+    # resolve_existing_column() catches both naming-convention differences
+    # (emp_name vs empName) AND table-prefixed id patterns (studentId -> id).
+    # It returns the key unchanged only when no existing column matches.
+    norm_map = build_normalized_column_map(existing_columns)
+    table_prefixes = derive_table_prefixes(table_name)
     missing_keys = []
     seen_norms = set()
     for k in all_keys:
+        resolved = resolve_existing_column(k, norm_map, table_prefixes)
         norm = normalize_key(k)
-        if norm not in existing_norms and norm not in seen_norms:
+        if resolved == k and norm not in seen_norms:
             missing_keys.append(k)
             seen_norms.add(norm)
 
@@ -590,7 +634,7 @@ def insert_data():
         # lands in the existing column instead of spawning a near-duplicate one.
         existing_columns_before = get_existing_columns(cursor, db_type, table_name)
         if existing_columns_before:
-            json_data = remap_rows_to_existing_columns(json_data, existing_columns_before)
+            json_data = remap_rows_to_existing_columns(json_data, existing_columns_before, table_name)
 
         # Remove duplicates
         unique_rows = []
